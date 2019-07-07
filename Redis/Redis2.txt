@@ -1,0 +1,205 @@
+Redis的设计与实现
+
+数据结构篇第二部分，链表和字典。
+
+1.链表
+
+Redis是C语言实现的，C语言没有链表，所以Redis的链表是Redis自己实现的。
+
+Redis中的列表键的实现之一就是链表。
+
+
+链表的节点使用在adList.h/listNode
+
+  /*
+   * 双端链表节点
+   */
+  typedef struct listNode {
+  
+      // 前置节点
+      struct listNode *prev;
+  
+      // 后置节点
+     struct listNode *next;
+ 
+     // 节点的值
+     void *value;
+ 
+ } listNode;
+
+ 这是一个典型的双端链表
+
+ 链表的结构在adList.h/List
+
+ /*
+ * 双端链表结构
+ */
+typedef struct list {
+
+    // 表头节点
+    listNode *head;
+
+    // 表尾节点
+    listNode *tail;
+
+    // 节点值复制函数
+    void *(*dup)(void *ptr);
+
+    // 节点值释放函数
+    void (*free)(void *ptr);
+
+    // 节点值对比函数
+    int (*match)(void *ptr, void *key);
+
+    // 链表所包含的节点数量
+    unsigned long len;
+
+} list;
+
+
+redis的链表特性如下：
+　　1）双向：每个listNode节点带有prev和next指针，可以找到前一个节点和后一个节点，具有双向性。
+　　2）无环：list链表的head节点的prev和tail节点的next指针都是指向null。
+　　3）带表头指针和尾指针：即上述的head和tail，获取头指针和尾指针的时间复杂度O(1)。
+　　4）带链表长度计数器；即list的len属性，记录节点个数，因此获取节点个数的时间复杂度O(1)。
+　　5）多态:链表使用void*指针来保存节点的值，可以通过list的dup、free、match三个属性为节点值设置类型特定函数，所以链表可以用于保存不同类型的值。
+
+
+2.字典
+
+字典就是KV形式的数据结构，整个Redis数据库都是基于KV字典作为底层实现。对数据库增删改查操作也是在字典的操作之上完成的。
+
+Redis的字典是自己实现的，使用Hash表。一个Hash表里面有多个Hash节点，每个Hash节点保存了一个键值对（KV的对应）。
+
+Hash表的定义：dict.h/dictht
+
+/*
+ * 哈希表
+ *
+ * 每个字典都使用两个哈希表，从而实现渐进式 rehash 。
+ */
+typedef struct dictht {
+    
+    // 哈希表数组
+    dictEntry **table;
+
+    // 哈希表大小
+    unsigned long size;
+    
+    // 哈希表大小掩码，用于计算索引值
+    // 总是等于 size - 1
+    unsigned long sizemask;
+
+    // 该哈希表已有节点的数量
+    unsigned long used;
+
+} dictht;
+
+table的属性是一个数组，每个元素都是一个指向 dict.h/dictEntry结构的指针。
+
+Hash节点：
+
+/*
+ * 哈希表节点
+ */
+typedef struct dictEntry {
+    
+    // 键
+    void *key;
+
+    // 值
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+    } v;
+
+    // 指向下个哈希表节点，形成链表
+    struct dictEntry *next;
+
+} dictEntry;
+
+其中，key表示节点的键；union表示key对应的值，可以是指针、uint64_t整数或int64_t整数；
+next是指向另一个哈希表节点的指针，该指针将多个哈希值相同的键值对连接在一起，避免因为哈希值相同导致的冲突。
+
+
+字典的结构：
+/*
+ * 字典
+ */
+typedef struct dict {
+
+    // 类型特定函数
+    dictType *type;
+
+    // 私有数据
+    void *privdata;
+
+    // 哈希表
+    dictht ht[2];
+
+    // rehash 索引
+    // 当 rehash 不在进行时，值为 -1
+    int rehashidx; /* rehashing not in progress if rehashidx == -1 */
+
+    // 目前正在运行的安全迭代器的数量
+    int iterators; /* number of iterators currently running */
+
+} dict;
+
+type用于存放用于处理特定类型的处理函数；
+
+privdata用于存放私有数据，保存传给type内的函数的数据；
+
+rehash是一个索引，当没有在rehash进行时，值是-1；
+
+ht是包含两个项的数组，每个项是一个哈希表，一般情况下只是用ht[0]，只有在对ht[0]进行rehash时，才会使用ht[1]。
+
+
+哈希算法
+要将新的键值对加到字典，程序要先对键进行哈希算法，算出哈希值和索引值，再根据索引值，把包含新键值对的哈希表节点放到哈希表数组指定的索引上。
+redis实现哈希的代码是：
+　　hash =dict->type->hashFunction(key);
+　　index = hash& dict->ht[x].sizemask;
+算出来的结果中，index的值是多少，则key会落在table里面的第index个位置（第一个位置index是0）。
+其中，redis的hashFunction，采用的是murmurhash2算法，是一种非加密型hash算法，其具有高速的特点。
+
+键冲突解决
+当两个或者以上的键被分配到哈希表数组的同一个索引上，则称这些键发生了冲突。
+为了解决此问题，redis采用链地址法。被分配到同一个索引上的多个节点可以用单链表连接起来。
+因为没有指向尾节点的指针，所以总是将新节点加在表头的位置。（O(1)时间）
+
+rehash（重新散列）
+随着操作进行，哈希表保存的键值对会增加或减少，为了让哈希表的负载因子（load factor）维持在一个合理范围，当一个哈希表保存的键太多或者太少，需要对哈希表进行扩展或者收缩。扩展或收缩哈希表的过程，就称为rehash。
+rehash步骤如下：
+1、给字典的ht[1]申请存储空间，大小取决于要进行的操作，以及ht[0]当前键值对的数量（ht[0].used）。假设当前ht[0].used=x。
+如果是扩展，则ht[1]的值是第一个大于等于x*2的2n的值。例如x是30，则ht[1]的大小是第一个大于等于30*2的2n的值，即64。
+如果是收缩，则ht[1]的值是第一个大于等于x的2n的值。例如x是30，则ht[1]的大小是第一个大于等于30的2n的值，即32。
+
+2、将保存在ht[0]上面的所有键值对，rehash到ht[1]，即对每个键重新采用哈希算法的方式计算哈希值和索引值，再放到相应的ht[1]的表格指定位置。
+
+3、当ht[0]的所有键值对都rehash到ht[1]后，释放ht[0]，并将ht[1]设置为ht[0]，再新建一个空的ht[1]，用于下一次rehash。
+
+rehash条件：
+负载因子（load factor）计算：
+load_factor =ht[0].used / ht[0].size，即负载因子大小等于当前哈希表的键值对数量，除以当前哈希表的大小。
+
+扩展：
+当以下任一条件满足，哈希表会自动进行扩展操作：
+1）服务器目前没有在执行BGSAVE或者BGREWRITEAOF命令，且负载因子大于等于1。
+2）服务器目前正在在执行BGSAVE或者BGREWRITEAOF命令，且负载因子大于等于5。
+
+收缩：
+当负载因子小于0.1时，redis自动开始哈希表的收缩工作。
+
+渐进式rehash
+redis对ht[0]扩展或收缩到ht[1]的过程，并不是一次性完成的，而是渐进式、分多次的完成，以避免如果哈希表中存有大量键值对，一次性复制过程中，占用资源较多，会导致redis服务停用的问题。
+渐进式rehash过程如下：
+1、为ht[1]分配空间，让字典同时持有ht[0]和ht[1]两张哈希表。
+2、将字典中的rehashidx设置成0，表示正在rehash。rehashidx的值默认是-1，表示没有在rehash。
+3、在rehash进行期间，程序处理正常对字典进行增删改查以外，还会顺带将ht[0]哈希表上，rehashidx索引上，所有的键值对数据rehash到ht[1]，并且rehashidx的值加1。
+4、当某个时间节点，全部的ht[0]都迁移到ht[1]后，rehashidx的值重新设定为-1，表示rehash完成。
+
+渐进式rehash采用分而治之的工作方式，将哈希表的迁移工作所耗费的时间，平摊到增删改查中，避免集中rehash导致的庞大计算量。
+在rehash期间，对哈希表的查找、修改、删除，会先在ht[0]进行。
+如果ht[0]中没找到相应的内容，则会去ht[1]查找，并进行相关的修改、删除操作。而增加的操作，会直接增加到ht[1]中，目的是让ht[0]只减不增，加快迁移的速度。
